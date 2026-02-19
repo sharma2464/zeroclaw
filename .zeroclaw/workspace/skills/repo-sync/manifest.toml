@@ -1,0 +1,8 @@
+name = "repo-sync"
+version = "0.1.0"
+description = "Safely syncs your local ZeroClaw fork with the upstream repository while validating the build."
+
+[[tools]]
+name = "sync_upstream"
+command = "./scripts/sync_upstream.sh"
+description = "Syncs with origin/main, rebases local changes, and validates the build on Android/Termux."

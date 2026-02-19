@@ -21,10 +21,18 @@ use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
 };
+
+/// Built-in Control UI HTML (embedded at compile time)
+const CONTROL_UI_HTML: &str = include_str!("index.html");
+
+/// GET / — serve built-in Control UI
+async fn handle_index() -> impl IntoResponse {
+    Html(CONTROL_UI_HTML)
+}
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -526,6 +534,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build router with middleware
     let app = Router::new()
+        .route("/", get(handle_index))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
