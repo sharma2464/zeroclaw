@@ -1,7 +1,9 @@
 use crate::providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
 use crate::tools::{Tool, ToolSpec};
+use regex::Regex;
 use serde_json::Value;
 use std::fmt::Write;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -29,48 +31,475 @@ pub trait ToolDispatcher: Send + Sync {
 #[derive(Default)]
 pub struct XmlToolDispatcher;
 
+const TOOL_CALL_OPEN_TAGS: [&str; 4] = ["<tool_call", "<toolcall", "<tool-call", "<invoke"];
+
+fn map_glm_tool_alias(tool_name: &str) -> &str {
+    match tool_name {
+        "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
+        "http_request" | "http" => "http_request",
+        _ => tool_name,
+    }
+}
+
+fn build_curl_command(url: &str) -> Option<String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let escaped = url.replace('\'', r#"'\\''"#);
+    Some(format!("curl -s '{}'", escaped))
+}
+
+fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, Value, Option<String>)> {
+    let mut calls = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Format: tool_name/param>value or tool_name/{json}
+        if let Some(pos) = line.find('/') {
+            let tool_part = &line[..pos];
+            let rest = &line[pos + 1..];
+
+            if tool_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                let tool_name = map_glm_tool_alias(tool_part);
+
+                if let Some(gt_pos) = rest.find('>') {
+                    let param_name = rest[..gt_pos].trim();
+                    let value = rest[gt_pos + 1..].trim();
+
+                    let arguments = match tool_name {
+                        "shell" => {
+                            if param_name == "url" {
+                                let Some(command) = build_curl_command(value) else {
+                                    continue;
+                                };
+                                serde_json::json!({"command": command})
+                            } else if value.starts_with("http://") || value.starts_with("https://")
+                            {
+                                if let Some(command) = build_curl_command(value) {
+                                    serde_json::json!({"command": command})
+                                } else {
+                                    serde_json::json!({"command": value})
+                                }
+                            } else {
+                                serde_json::json!({"command": value})
+                            }
+                        }
+                        "http_request" => {
+                            serde_json::json!({"url": value, "method": "GET"})
+                        }
+                        _ => serde_json::json!({param_name: value}),
+                    };
+
+                    calls.push((tool_name.to_string(), arguments, Some(line.to_string())));
+                    continue;
+                }
+
+                if rest.starts_with('{') {
+                    if let Ok(json_args) = serde_json::from_str::<Value>(rest) {
+                        calls.push((tool_name.to_string(), json_args, Some(line.to_string())));
+                    }
+                }
+            }
+        }
+
+        // Plain URL
+        if let Some(command) = build_curl_command(line) {
+            calls.push((
+                "shell".to_string(),
+                serde_json::json!({"command": command}),
+                Some(line.to_string()),
+            ));
+        }
+    }
+
+    calls
+}
+
+fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, &str)> = None;
+
+    for &tag in tags {
+        // Look for the tag followed by either a space or a closing bracket
+        let mut start_idx = 0;
+        while let Some(idx) = haystack[start_idx..].find(tag) {
+            let actual_idx = start_idx + idx;
+            let after_tag = &haystack[actual_idx + tag.len()..];
+            if after_tag.starts_with('>') || after_tag.starts_with(char::is_whitespace) {
+                if best.is_none() || actual_idx < best.unwrap().0 {
+                    best = Some((actual_idx, tag));
+                }
+                break;
+            }
+            start_idx = actual_idx + 1;
+        }
+    }
+    best
+}
+
+fn matching_tool_call_close_tag(open_tag: &str) -> Option<&'static str> {
+    if open_tag.starts_with("<tool_call") {
+        Some("</tool_call>")
+    } else if open_tag.starts_with("<toolcall") {
+        Some("</toolcall>")
+    } else if open_tag.starts_with("<tool-call") {
+        Some("</tool-call>")
+    } else if open_tag.starts_with("<invoke") {
+        Some("</invoke>")
+    } else {
+        None
+    }
+}
+
+fn find_tag_end(haystack: &str, start_idx: usize) -> Option<usize> {
+    haystack[start_idx..].find('>').map(|idx| start_idx + idx + 1)
+}
+
+fn parse_arguments_value(raw: Option<&Value>) -> Value {
+    match raw {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
+        Some(value) => value.clone(),
+        None => Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn parse_tool_call_value(value: &Value) -> Option<ParsedToolCall> {
+    if let Some(function) = value.get("function") {
+        let name = function
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            let arguments = parse_arguments_value(function.get("arguments"));
+            return Some(ParsedToolCall {
+                name,
+                arguments,
+                tool_call_id: None,
+            });
+        }
+    }
+
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = parse_arguments_value(value.get("arguments"));
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        tool_call_id: None,
+    })
+}
+
+fn parse_tool_calls_from_json_value(value: &Value) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+
+    if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
+        for call in tool_calls {
+            if let Some(parsed) = parse_tool_call_value(call) {
+                calls.push(parsed);
+            }
+        }
+
+        if !calls.is_empty() {
+            return calls;
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        for item in array {
+            if let Some(parsed) = parse_tool_call_value(item) {
+                calls.push(parsed);
+            }
+        }
+        return calls;
+    }
+
+    if let Some(parsed) = parse_tool_call_value(value) {
+        calls.push(parsed);
+    }
+
+    calls
+}
+
+fn extract_json_values(input: &str) -> Vec<Value> {
+    let mut values = Vec::new();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return values;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        values.push(value);
+        return values;
+    }
+
+    let char_positions: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut idx = 0;
+    while idx < char_positions.len() {
+        let (byte_idx, ch) = char_positions[idx];
+        if ch == '{' || ch == '[' {
+            let slice = &trimmed[byte_idx..];
+            let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<Value>();
+            if let Some(Ok(value)) = stream.next() {
+                let consumed = stream.byte_offset();
+                if consumed > 0 {
+                    values.push(value);
+                    let next_byte = byte_idx + consumed;
+                    while idx < char_positions.len() && char_positions[idx].0 < next_byte {
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    values
+}
+
+fn find_json_end(input: &str) -> Option<usize> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in trimmed.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + i + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn extract_first_json_value_with_end(input: &str) -> Option<(Value, usize)> {
+    let trimmed = input.trim_start();
+    let trim_offset = input.len().saturating_sub(trimmed.len());
+
+    for (byte_idx, ch) in trimmed.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+
+        let slice = &trimmed[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<Value>();
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                return Some((value, trim_offset + byte_idx + consumed));
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_leading_close_tags(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start();
+        if !trimmed.starts_with("</") {
+            return trimmed;
+        }
+
+        let Some(close_end) = trimmed.find('>') else {
+            return "";
+        };
+        input = &trimmed[close_end + 1..];
+    }
+}
+
+static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>)",
+    )
+    .unwrap()
+});
+
+fn matching_tool_call_close_re(open_tag: &str) -> Option<Regex> {
+    if open_tag.starts_with("<tool_call") {
+        Some(Regex::new(r"(?i)</\s*tool_call\s*>").unwrap())
+    } else if open_tag.starts_with("<toolcall") {
+        Some(Regex::new(r"(?i)</\s*toolcall\s*>").unwrap())
+    } else if open_tag.starts_with("<tool-call") {
+        Some(Regex::new(r"(?i)</\s*tool-call\s*>").unwrap())
+    } else if open_tag.starts_with("<invoke") {
+        Some(Regex::new(r"(?i)</\s*invoke\s*>").unwrap())
+    } else {
+        None
+    }
+}
+
 impl XmlToolDispatcher {
-    fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+    pub(crate) fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
         let mut remaining = response;
 
-        while let Some(start) = remaining.find("<tool_call>") {
+        // Try OpenAI-style JSON first
+        if let Ok(json_value) = serde_json::from_str::<Value>(response.trim()) {
+            let json_calls = parse_tool_calls_from_json_value(&json_value);
+            if !json_calls.is_empty() {
+                if let Some(content) = json_value.get("content").and_then(|v| v.as_str()) {
+                    if !content.trim().is_empty() {
+                        text_parts.push(content.trim().to_string());
+                    }
+                }
+                return (text_parts.join("\n"), json_calls);
+            }
+        }
+
+        while let Some((start, _prefix)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
             let before = &remaining[..start];
             if !before.trim().is_empty() {
                 text_parts.push(before.trim().to_string());
             }
 
-            if let Some(end) = remaining[start..].find("</tool_call>") {
-                let inner = &remaining[start + 11..start + end];
-                match serde_json::from_str::<Value>(inner.trim()) {
-                    Ok(parsed) => {
-                        let name = parsed
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        if name.is_empty() {
-                            remaining = &remaining[start + end + 12..];
-                            continue;
-                        }
-                        let arguments = parsed
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                        calls.push(ParsedToolCall {
-                            name,
-                            arguments,
-                            tool_call_id: None,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("Malformed <tool_call> JSON: {e}");
+            let Some(tag_end_idx) = find_tag_end(remaining, start) else {
+                break;
+            };
+
+            let open_tag = &remaining[start..tag_end_idx];
+            let Some(close_re) = matching_tool_call_close_re(open_tag) else {
+                break;
+            };
+
+            let after_open = &remaining[tag_end_idx..];
+            if let Some(mat) = close_re.find(after_open) {
+                let close_start = mat.start();
+                let close_end = mat.end();
+                let inner = &after_open[..close_start];
+                let mut parsed_any = false;
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        parsed_any = true;
+                        calls.extend(parsed_calls);
                     }
                 }
-                remaining = &remaining[start + end + 12..];
+
+                if !parsed_any {
+                    tracing::warn!(
+                        "Malformed <tool_call> JSON: expected tool-call object in tag body"
+                    );
+                }
+
+                remaining = &after_open[close_end..];
             } else {
+                if let Some(json_end) = find_json_end(after_open) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&after_open[..json_end]) {
+                        let parsed_calls = parse_tool_calls_from_json_value(&value);
+                        if !parsed_calls.is_empty() {
+                            calls.extend(parsed_calls);
+                            remaining = strip_leading_close_tags(&after_open[json_end..]);
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some((value, consumed_end)) = extract_first_json_value_with_end(after_open) {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        calls.extend(parsed_calls);
+                        remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+                        continue;
+                    }
+                }
+
+                remaining = &remaining[start..];
                 break;
+            }
+        }
+
+        // Markdown blocks
+        if calls.is_empty() {
+            let mut md_text_parts: Vec<String> = Vec::new();
+            let mut last_end = 0;
+
+            for cap in MD_TOOL_CALL_RE.captures_iter(response) {
+                let full_match = cap.get(0).unwrap();
+                let before = &response[last_end..full_match.start()];
+                if !before.trim().is_empty() {
+                    md_text_parts.push(before.trim().to_string());
+                }
+                let inner = &cap[1];
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    calls.extend(parsed_calls);
+                }
+                last_end = full_match.end();
+            }
+
+            if !calls.is_empty() {
+                let after = &response[last_end..];
+                if !after.trim().is_empty() {
+                    md_text_parts.push(after.trim().to_string());
+                }
+                text_parts = md_text_parts;
+                remaining = "";
+            }
+        }
+
+        // GLM-style tool calls (browser_open/url>https://..., shell/command>ls, etc.)
+        if calls.is_empty() {
+            let glm_calls = parse_glm_style_tool_calls(remaining);
+            if !glm_calls.is_empty() {
+                let mut cleaned_text = remaining.to_string();
+                for (name, args, raw) in &glm_calls {
+                    calls.push(ParsedToolCall {
+                        name: name.clone(),
+                        arguments: args.clone(),
+                        tool_call_id: None,
+                    });
+                    if let Some(r) = raw {
+                        cleaned_text = cleaned_text.replace(r, "");
+                    }
+                }
+                if !cleaned_text.trim().is_empty() {
+                    text_parts.push(cleaned_text.trim().to_string());
+                }
+                remaining = "";
             }
         }
 
@@ -248,6 +677,34 @@ mod tests {
         let (_, calls) = dispatcher.parse_response(&response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn xml_dispatcher_handles_whitespace_in_tags() {
+        let response = ChatResponse {
+            text: Some(
+                "<tool_call >{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
+                    .into(),
+            ),
+            tool_calls: vec![],
+        };
+        let dispatcher = XmlToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn xml_dispatcher_handles_glm_style() {
+        let response = ChatResponse {
+            text: Some("shell/command>ls -la".into()),
+            tool_calls: vec![],
+        };
+        let dispatcher = XmlToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
     }
 
     #[test]

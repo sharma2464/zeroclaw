@@ -1,0 +1,23 @@
+warning: unused import: `super::registry`
+ --> src/hardware/discover.rs:3:5
+  |
+3 | use super::registry;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> src/onboard/wizard.rs:3617:13
+     |
+3541 |             10 => {
+     |             -- matches all the relevant values
+...
+3617 |             10 => {
+     |             ^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zeroclaw` (lib) generated 2 warnings (run `cargo fix --lib -p zeroclaw` to apply 1 suggestion)
+   Compiling zeroclaw v0.1.0 (/data/data/com.termux/files/home/zeroclaw)
+warning: `zeroclaw` (bin "zeroclaw") generated 2 warnings (2 duplicates)
+    Finished `release` profile [optimized] target(s) in 10m 14s
