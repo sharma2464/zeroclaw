@@ -38,6 +38,7 @@ Last refreshed: **February 18, 2026**.
 - [operations/README.md](operations/README.md)
 - [operations-runbook.md](operations-runbook.md)
 - [troubleshooting.md](troubleshooting.md)
+- [termux-setup.md](termux-setup.md)
 - [network-deployment.md](network-deployment.md)
 - [mattermost-setup.md](mattermost-setup.md)
 

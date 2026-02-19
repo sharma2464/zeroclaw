@@ -8,6 +8,7 @@
 
 use super::registry;
 use anyhow::Result;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use nusb::MaybeFuture;
 
 /// Information about a discovered USB device.
@@ -25,27 +26,37 @@ pub struct UsbDeviceInfo {
 /// Enumerate all connected USB devices and enrich with board registry lookup.
 #[cfg(feature = "hardware")]
 pub fn list_usb_devices() -> Result<Vec<UsbDeviceInfo>> {
-    let mut devices = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let mut devices = Vec::new();
 
-    let iter = nusb::list_devices()
-        .wait()
-        .map_err(|e| anyhow::anyhow!("USB enumeration failed: {e}"))?;
+        let iter = nusb::list_devices()
+            .wait()
+            .map_err(|e| anyhow::anyhow!("USB enumeration failed: {e}"))?;
 
-    for dev in iter {
-        let vid = dev.vendor_id();
-        let pid = dev.product_id();
-        let board = registry::lookup_board(vid, pid);
+        for dev in iter {
+            let vid = dev.vendor_id();
+            let pid = dev.product_id();
+            let board = registry::lookup_board(vid, pid);
 
-        devices.push(UsbDeviceInfo {
-            bus_id: dev.bus_id().to_string(),
-            device_address: dev.device_address(),
-            vid,
-            pid,
-            product_string: dev.product_string().map(String::from),
-            board_name: board.map(|b| b.name.to_string()),
-            architecture: board.and_then(|b| b.architecture.map(String::from)),
-        });
+            devices.push(UsbDeviceInfo {
+                bus_id: dev.bus_id().to_string(),
+                device_address: dev.device_address(),
+                vid,
+                pid,
+                product_string: dev.product_string().map(String::from),
+                board_name: board.map(|b| b.name.to_string()),
+                architecture: board.and_then(|b| b.architecture.map(String::from)),
+            });
+        }
+
+        Ok(devices)
     }
 
-    Ok(devices)
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        // On Android/Termux or other platforms, nusb::list_devices() is not available.
+        // Returning an empty list or error.
+        anyhow::bail!("USB enumeration is not supported on this platform (target_os: {})", std::env::consts::OS)
+    }
 }
